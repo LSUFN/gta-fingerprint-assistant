@@ -82,6 +82,16 @@ namespace GtaCasinoAssistant
                 }
                 return;
             }
+            if (args.Length == 2 && args[0] == "--keypad-stage")
+            {
+                using (Bitmap screenshot = new Bitmap(args[1]))
+                {
+                    bool inputStage = CasinoKeypadScanner.IsInputStage(screenshot);
+                    Console.WriteLine(inputStage ? "INPUT" : "PATTERN");
+                    Environment.ExitCode = inputStage ? 1 : 0;
+                }
+                return;
+            }
             if (args.Length == 2 && args[0] == "--probe")
             {
                 RunProbe(args[1]);

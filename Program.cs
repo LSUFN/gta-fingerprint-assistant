@@ -2176,7 +2176,22 @@ namespace GtaCasinoAssistant
             if (screenshot == null) return false;
             int row;
             for (int column = 1; column <= 6; column++)
-                if (TryDetectRingRow(screenshot, column, out row)) return true;
+                if (TryDetectInputRingRow(screenshot, column, out row)) return true;
+            return false;
+        }
+
+        private static bool TryDetectInputRingRow(Bitmap screenshot, int column, out int row)
+        {
+            row = 0;
+            if (screenshot == null || column < 1 || column > 6 || screenshot.Width < 960 || screenshot.Height < 540)
+                return false;
+            List<CanonicalScreenTransform> transforms = CanonicalScreenLayouts.Create(screenshot);
+            for (int index = 0; index < transforms.Count; index++)
+            {
+                string diagnostic;
+                if (TryDetectRingRowTransform(screenshot, column, transforms[index], false, out row, out diagnostic))
+                    return true;
+            }
             return false;
         }
 
@@ -2195,7 +2210,7 @@ namespace GtaCasinoAssistant
                 && _preferredTransform >= 0 && _preferredTransform < transforms.Count)
             {
                 string preferredDiagnostic;
-                if (TryDetectRingRowTransform(screenshot, column, transforms[_preferredTransform], out row, out preferredDiagnostic))
+                if (TryDetectRingRowTransform(screenshot, column, transforms[_preferredTransform], true, out row, out preferredDiagnostic))
                 {
                     LastRingDiagnostic = preferredDiagnostic + " layout=" + transforms[_preferredTransform].Name;
                     return true;
@@ -2205,7 +2220,7 @@ namespace GtaCasinoAssistant
             for (int index = 0; index < transforms.Count; index++)
             {
                 string diagnostic;
-                if (!TryDetectRingRowTransform(screenshot, column, transforms[index], out row, out diagnostic)) continue;
+                if (!TryDetectRingRowTransform(screenshot, column, transforms[index], true, out row, out diagnostic)) continue;
                 _preferredTransform = index;
                 _preferredWidth = screenshot.Width;
                 _preferredHeight = screenshot.Height;
@@ -2217,7 +2232,7 @@ namespace GtaCasinoAssistant
         }
 
         private static bool TryDetectRingRowTransform(Bitmap screenshot, int column,
-            CanonicalScreenTransform transform, out int row, out string diagnostic)
+            CanonicalScreenTransform transform, bool allowBrightnessFallback, out int row, out string diagnostic)
         {
             row = 0;
             diagnostic = "";
@@ -2273,9 +2288,10 @@ namespace GtaCasinoAssistant
             // relative to the 1920x1080 reference center. Fall back to comparing
             // the whole cell band, where the thick active ring still contains
             // far more bright pixels than the five inactive outlines.
-            int fallbackRow;
-            double fallbackBest, fallbackSecond;
-            if (TryDetectRingByCellBrightness(screenshot, column, transform, out fallbackRow, out fallbackBest, out fallbackSecond))
+            int fallbackRow = 0;
+            double fallbackBest = 0, fallbackSecond = 0;
+            if (allowBrightnessFallback
+                && TryDetectRingByCellBrightness(screenshot, column, transform, out fallbackRow, out fallbackBest, out fallbackSecond))
             {
                 row = fallbackRow;
                 diagnostic = "cell col=" + column + " row=" + row + " score=" + fallbackBest.ToString("F3");
@@ -2988,6 +3004,9 @@ namespace GtaCasinoAssistant
         private CayoVoltageResult _voltageResult;
         private CasinoKeypadResult _keypadResult;
         private DateTime _keypadCapturedAtUtc = DateTime.MinValue;
+        private DateTime _keypadLastPatternSeenUtc = DateTime.MinValue;
+        private string _keypadLastPatternKey = "";
+        private int _keypadPatternGroupCount = 0;
         private int _keypadInputStageFrames = 0;
         // After submitting one keypad round, do not reuse its captured pattern.
         // The next pattern screen is the explicit re-arm signal for another round.
@@ -3459,11 +3478,20 @@ namespace GtaCasinoAssistant
                 _pendingDetection = "";
                 _pendingDetectionFrames = 0;
                 _hasStableDetection = false;
+                _keypadLastPatternSeenUtc = DateTime.MinValue;
+                _keypadLastPatternKey = "";
+                _keypadPatternGroupCount = 0;
             }
 
             if (patternVisible)
             {
                 string key = detected.DetectionKey;
+                _keypadLastPatternSeenUtc = DateTime.UtcNow;
+                if (key != _keypadLastPatternKey)
+                {
+                    _keypadLastPatternKey = key;
+                    _keypadPatternGroupCount++;
+                }
                 _missedDetectionFrames = 0;
                 _keypadInputStageFrames = 0;
                 if (key == _pendingDetection) _pendingDetectionFrames++;
@@ -3484,6 +3512,7 @@ namespace GtaCasinoAssistant
                 _solverMode = "keypad";
                 SetKeypadTarget(detected, false);
                 SetStableKeypadState(detected, false);
+                SetAutomationStatus("已记录第 " + _keypadPatternGroupCount + " 组亮点 · 继续等待最后一组与输入光圈");
                 return;
             }
 
@@ -3496,7 +3525,12 @@ namespace GtaCasinoAssistant
                 return;
             }
 
-            if (_keypadResult != null && CasinoKeypadScanner.IsInputStage(screenBmp))
+            // Decoy groups are separated by short blank/fade intervals. Do not
+            // mistake those transitions for the input phase; keep replacing the
+            // candidate so the last complete group becomes the final answer.
+            if (_keypadResult != null
+                && DateTime.UtcNow - _keypadLastPatternSeenUtc >= TimeSpan.FromMilliseconds(280)
+                && CasinoKeypadScanner.IsInputStage(screenBmp))
             {
                 _keypadInputStageFrames++;
                 SetStableKeypadState(_keypadResult, true);
@@ -3801,6 +3835,9 @@ namespace GtaCasinoAssistant
                 _keypadInputStageFrames = 0;
                 _keypadWaitingForNextPattern = true;
                 _keypadSawPatternGap = false;
+                _keypadLastPatternSeenUtc = DateTime.MinValue;
+                _keypadLastPatternKey = "";
+                _keypadPatternGroupCount = 0;
                 SetAutomationStatus("⚠ 本轮点阵已放弃，自动仍保持开启：" + ex.Message);
             }
             finally { _inputInProgress = false; }
@@ -5270,6 +5307,9 @@ namespace GtaCasinoAssistant
             _voltageResult = null;
             _keypadResult = null;
             _keypadCapturedAtUtc = DateTime.MinValue;
+            _keypadLastPatternSeenUtc = DateTime.MinValue;
+            _keypadLastPatternKey = "";
+            _keypadPatternGroupCount = 0;
             _keypadInputStageFrames = 0;
             _keypadWaitingForNextPattern = false;
             _keypadSawPatternGap = false;

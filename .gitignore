@@ -1,0 +1,33 @@
+# Build outputs
+bin/
+dist/
+*.exe
+*.pdb
+*.zip
+*.sha256
+
+# Local diagnostics and generated screenshots
+*.log
+*.tmp
+*.bak
+preview_*.png
+sim_out_*.png
+simulator-preview.png
+q*_debug.png
+
+# Local calibration and reverse-engineering scratch files
+Program.cs.initial
+Program.cs.orig
+Program.cs.step*
+templates/cayo_*.png
+templates/quadrant_*.png
+templates/user/
+
+# IDE and OS files
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
+

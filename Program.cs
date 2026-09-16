@@ -2857,7 +2857,6 @@ namespace GtaCasinoAssistant
         private static readonly Size CompactWindowSize = new Size(390, 324);
         private static readonly Size ExpandedWindowSize = new Size(710, 400);
         private const int RequiredStableFrames = 2;
-        private const int RequiredKeypadStableFrames = 4;
         private const int RequiredGuardedFrames = 3;
         private const double FastExecutionConfidence = 0.55;
         private const int AllowedMissedFrames = 3;
@@ -2968,6 +2967,7 @@ namespace GtaCasinoAssistant
         private volatile bool _autoInputEnabled = false;
         private volatile bool _turboModeEnabled = false;
         private volatile bool _inputInProgress = false;
+        private DateTime _casinoRetryAfterUtc = DateTime.MinValue;
         private const int ModeCasinoFingerprint = 0;
         private const int ModeCayoFingerprint = 1;
         private const int ModeCayoVoltage = 2;
@@ -3304,7 +3304,9 @@ namespace GtaCasinoAssistant
                                     SetStableDetectionState(matched, slots, conf);
 
                                     int framesNeededForInput = conf >= FastExecutionConfidence ? RequiredStableFrames : RequiredGuardedFrames;
-                                    if (_autoInputEnabled && !_inputInProgress && key != _lastExecutedDetection && _pendingDetectionFrames >= framesNeededForInput)
+                                    if (_autoInputEnabled && !_inputInProgress && key != _lastExecutedDetection
+                                        && DateTime.UtcNow >= _casinoRetryAfterUtc
+                                        && _pendingDetectionFrames >= framesNeededForInput)
                                     {
                                         _lastExecutedDetection = key;
                                         _inputInProgress = true;
@@ -3467,7 +3469,11 @@ namespace GtaCasinoAssistant
                 if (key == _pendingDetection) _pendingDetectionFrames++;
                 else { _pendingDetection = key; _pendingDetectionFrames = 1; }
                 _lastConfidencePercent = (int)Math.Round(detected.Confidence * 100);
-                if (_pendingDetectionFrames < RequiredKeypadStableFrames)
+                // The real game can expose the six illuminated nodes for only a
+                // short time. A very clear pattern is safe on the first frame;
+                // weaker captures still need a second identical frame.
+                int keypadFramesNeeded = detected.MinimumColumnConfidence >= 0.70 ? 1 : RequiredStableFrames;
+                if (_pendingDetectionFrames < keypadFramesNeeded)
                 {
                     SetPendingDetectionState(detected.Confidence);
                     return;
@@ -4014,9 +4020,13 @@ namespace GtaCasinoAssistant
                 // 光标检测是可选安全校验：能看清时必须一致，
                 // 受特效影响时不因“未知”阻塞已经复核过的执行。
                 Thread.Sleep(GetSubmitPauseMs());
+                // Do not block submission on the post-selection cursor detector.
+                // Selected/highlighted components can look like the cursor ring;
+                // the preflight and foreground checks already guard the operation.
                 int verifiedCursor = DetectCurrentCasinoCursor();
                 if (verifiedCursor > 0 && verifiedCursor != currentSlot)
-                    throw new InvalidOperationException(string.Format("光标偏移：预期 {0}，实际 {1}", currentSlot, verifiedCursor));
+                    AppLog.WriteThrottled("CasinoCursorAdvisory",
+                        new InvalidOperationException(string.Format("提交前光标读数不同：预期 {0}，读到 {1}", currentSlot, verifiedCursor)));
                 if (!IsGtaForeground())
                     throw new InvalidOperationException("提交前 GTA 5 已失去前台焦点");
 
@@ -4043,6 +4053,8 @@ namespace GtaCasinoAssistant
                 if (_isScanning)
                 {
                     AppLog.Write("CasinoInput", ex);
+                    _lastExecutedDetection = "";
+                    _casinoRetryAfterUtc = DateTime.UtcNow.AddMilliseconds(1500);
                     DisableAutoAfterSafetyStop();
                     SetAutomationStatus("⚠ 本轮按键已停止，F8 仍保持开启：" + ex.Message);
                 }

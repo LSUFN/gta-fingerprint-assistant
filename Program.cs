@@ -2085,6 +2085,7 @@ namespace GtaCasinoAssistant
     {
         public int[] Rows;
         public double Confidence;
+        public double MinimumColumnConfidence;
         public string DetectionKey { get { return "keypad:" + string.Join(",", Rows); } }
     }
 
@@ -2103,25 +2104,19 @@ namespace GtaCasinoAssistant
             result = null;
             if (screenshot == null || screenshot.Width < 960 || screenshot.Height < 540) return false;
             List<CanonicalScreenTransform> transforms = CanonicalScreenLayouts.Create(screenshot);
-            if (_preferredWidth == screenshot.Width && _preferredHeight == screenshot.Height
-                && _preferredTransform >= 0 && _preferredTransform < transforms.Count)
-            {
-                CasinoKeypadResult preferred;
-                if (TryScanPatternTransform(screenshot, transforms[_preferredTransform], out preferred))
-                {
-                    result = preferred;
-                    LastPatternDiagnostic = "ok " + transforms[_preferredTransform].Name + " cached";
-                    return true;
-                }
-            }
-
             CasinoKeypadResult winner = null;
             int winnerIndex = -1;
             for (int index = 0; index < transforms.Count; index++)
             {
                 CasinoKeypadResult current;
                 if (!TryScanPatternTransform(screenshot, transforms[index], out current)) continue;
-                if (winner == null || current.Confidence > winner.Confidence)
+                double currentScore = current.MinimumColumnConfidence * 0.70 + current.Confidence * 0.30;
+                double winnerScore = winner == null ? -1.0
+                    : winner.MinimumColumnConfidence * 0.70 + winner.Confidence * 0.30;
+                bool cachedTie = Math.Abs(currentScore - winnerScore) < 0.015
+                    && _preferredWidth == screenshot.Width && _preferredHeight == screenshot.Height
+                    && index == _preferredTransform;
+                if (winner == null || currentScore > winnerScore || cachedTie)
                 {
                     winner = current;
                     winnerIndex = index;
@@ -2146,6 +2141,7 @@ namespace GtaCasinoAssistant
             result = null;
             int[] rows = new int[6];
             double confidenceTotal = 0;
+            double minimumConfidence = 1.0;
             for (int column = 0; column < rows.Length; column++)
             {
                 int bestRow = -1, bestCount = 0, secondCount = 0;
@@ -2158,11 +2154,20 @@ namespace GtaCasinoAssistant
                 // Sampling stride scales with the layout, so the observed dot
                 // count stays roughly constant from 720p through 4K.
                 int minimum = 8;
-                if (bestRow < 0 || bestCount < minimum || bestCount < secondCount * 1.25) return false;
+                double columnConfidence = (bestCount - secondCount) / (double)Math.Max(minimum, bestCount);
+                if (bestRow < 0 || bestCount < minimum || bestCount < secondCount * 1.40
+                    || columnConfidence < 0.28) return false;
                 rows[column] = bestRow + 1;
-                confidenceTotal += Math.Min(1.0, (bestCount - secondCount) / (double)Math.Max(minimum, bestCount));
+                columnConfidence = Math.Min(1.0, columnConfidence);
+                confidenceTotal += columnConfidence;
+                minimumConfidence = Math.Min(minimumConfidence, columnConfidence);
             }
-            result = new CasinoKeypadResult { Rows = rows, Confidence = confidenceTotal / rows.Length };
+            result = new CasinoKeypadResult
+            {
+                Rows = rows,
+                Confidence = confidenceTotal / rows.Length,
+                MinimumColumnConfidence = minimumConfidence
+            };
             return true;
         }
 
@@ -2348,7 +2353,9 @@ namespace GtaCasinoAssistant
         {
             int max = Math.Max(color.R, Math.Max(color.G, color.B));
             int min = Math.Min(color.R, Math.Min(color.G, color.B));
-            return max >= 85 && max - min >= 24 && color.G > color.R + 12 && color.B > color.R + 8;
+            return max >= 90 && max - min >= 28
+                && color.G > color.R + 14 && color.B > color.R + 12
+                && Math.Abs(color.G - color.B) <= 82;
         }
     }
 
@@ -2850,6 +2857,7 @@ namespace GtaCasinoAssistant
         private static readonly Size CompactWindowSize = new Size(390, 324);
         private static readonly Size ExpandedWindowSize = new Size(710, 400);
         private const int RequiredStableFrames = 2;
+        private const int RequiredKeypadStableFrames = 4;
         private const int RequiredGuardedFrames = 3;
         private const double FastExecutionConfidence = 0.55;
         private const int AllowedMissedFrames = 3;
@@ -3459,7 +3467,7 @@ namespace GtaCasinoAssistant
                 if (key == _pendingDetection) _pendingDetectionFrames++;
                 else { _pendingDetection = key; _pendingDetectionFrames = 1; }
                 _lastConfidencePercent = (int)Math.Round(detected.Confidence * 100);
-                if (_pendingDetectionFrames < RequiredStableFrames)
+                if (_pendingDetectionFrames < RequiredKeypadStableFrames)
                 {
                     SetPendingDetectionState(detected.Confidence);
                     return;
@@ -3491,7 +3499,12 @@ namespace GtaCasinoAssistant
                 {
                     _lastExecutedDetection = _keypadResult.DetectionKey;
                     _inputInProgress = true;
-                    CasinoKeypadResult copy = new CasinoKeypadResult { Rows = (int[])_keypadResult.Rows.Clone(), Confidence = _keypadResult.Confidence };
+                    CasinoKeypadResult copy = new CasinoKeypadResult
+                    {
+                        Rows = (int[])_keypadResult.Rows.Clone(),
+                        Confidence = _keypadResult.Confidence,
+                        MinimumColumnConfidence = _keypadResult.MinimumColumnConfidence
+                    };
                     StartInputWorker(delegate { ExecuteKeypadInput(copy); });
                 }
                 return;
@@ -3737,7 +3750,7 @@ namespace GtaCasinoAssistant
             {
                 AppLog.Write("VoltageInput", ex);
                 DisableAutoAfterSafetyStop();
-                SetAutomationStatus("⚠ 信号箱自动执行已停止：" + ex.Message);
+                SetAutomationStatus("⚠ 信号箱本轮已停止，F8 仍保持开启：" + ex.Message);
             }
             finally { _inputInProgress = false; }
         }
@@ -4014,7 +4027,7 @@ namespace GtaCasinoAssistant
                 if (submission < 0)
                 {
                     DisableAutoAfterSafetyStop();
-                    SetAutomationStatus("⚠ 游戏返回 SIGNAL ERROR，自动已关闭");
+                    SetAutomationStatus("⚠ 游戏返回 SIGNAL ERROR，本轮已停止，F8 仍保持开启");
                 }
                 else if (submission > 0)
                 {
@@ -4031,7 +4044,7 @@ namespace GtaCasinoAssistant
                 {
                     AppLog.Write("CasinoInput", ex);
                     DisableAutoAfterSafetyStop();
-                    SetAutomationStatus("⚠ 按键执行异常: " + ex.Message);
+                    SetAutomationStatus("⚠ 本轮按键已停止，F8 仍保持开启：" + ex.Message);
                 }
             }
             finally
@@ -4130,7 +4143,9 @@ namespace GtaCasinoAssistant
 
         private void DisableAutoAfterSafetyStop()
         {
-            _autoInputEnabled = false;
+            // A transient focus or validation fault should stop only this round.
+            // The detection key prevents an immediate retry of the same puzzle.
+            _inputInProgress = false;
             UpdateAutoButton();
         }
 
@@ -5234,7 +5249,6 @@ namespace GtaCasinoAssistant
             _recognitionMode = mode;
             SaveRecognitionMode(mode);
             _lastUiStateKey = "";
-            _autoInputEnabled = false;
             _pendingDetection = "";
             _pendingDetectionFrames = 0;
             _missedDetectionFrames = 0;

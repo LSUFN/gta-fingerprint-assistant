@@ -1329,6 +1329,9 @@ namespace GtaCasinoAssistant
     {
         private const double MinimumAverageScore = 0.35;
         private const double MinimumTargetMargin = 0.04;
+        private static int _preferredLayout = -1;
+        private static int _preferredLayoutWidth;
+        private static int _preferredLayoutHeight;
 
         public sealed class AssignmentResult
         {
@@ -1344,7 +1347,36 @@ namespace GtaCasinoAssistant
             confidence = 0;
             if (db == null || screenshot == null || db.Targets.Count == 0) return false;
 
-            List<byte[,]> slots = ExtractSlots(screenshot);
+            List<Rectangle[]> layouts = GetSlotRectangleCandidates(screenshot);
+            if (_preferredLayoutWidth == screenshot.Width && _preferredLayoutHeight == screenshot.Height
+                && _preferredLayout >= 0 && _preferredLayout < layouts.Count
+                && TryMatchLayout(db, screenshot, layouts[_preferredLayout], out matchedTarget, out detectedSlots, out confidence))
+                return true;
+
+            for (int index = 0; index < layouts.Count; index++)
+            {
+                FingerprintTarget target;
+                List<int> slots;
+                double score;
+                if (!TryMatchLayout(db, screenshot, layouts[index], out target, out slots, out score)) continue;
+                matchedTarget = target;
+                detectedSlots = slots;
+                confidence = score;
+                _preferredLayout = index;
+                _preferredLayoutWidth = screenshot.Width;
+                _preferredLayoutHeight = screenshot.Height;
+                return true;
+            }
+            return false;
+        }
+
+        private static bool TryMatchLayout(FingerprintDatabase db, Bitmap screenshot, Rectangle[] rectangles,
+            out FingerprintTarget matchedTarget, out List<int> detectedSlots, out double confidence)
+        {
+            matchedTarget = null;
+            detectedSlots = new List<int>();
+            confidence = 0;
+            List<byte[,]> slots = ExtractSlots(screenshot, rectangles);
             if (slots.Count != 8) return false;
 
             List<AssignmentResult> results = new List<AssignmentResult>();
@@ -1388,6 +1420,43 @@ namespace GtaCasinoAssistant
             detectedSlots.Sort();
             confidence = winner.AverageScore;
             return true;
+        }
+
+        private static List<Rectangle[]> GetSlotRectangleCandidates(Bitmap screenshot)
+        {
+            List<Rectangle[]> result = new List<Rectangle[]>();
+            AddRectangleCandidate(result, GetSlotRectangles(screenshot));
+            foreach (CanonicalScreenTransform transform in CanonicalScreenLayouts.Create(screenshot))
+            {
+                Rectangle[] rectangles = new Rectangle[8];
+                int index = 0;
+                for (int row = 0; row < 4; row++)
+                    for (int col = 0; col < 2; col++)
+                        rectangles[index++] = transform.Map(new Rectangle(
+                            (int)Math.Round(456.0 + col * 150.2),
+                            (int)Math.Round(270.0 + row * 145.2),
+                            137, 132));
+                AddRectangleCandidate(result, rectangles);
+            }
+            return result;
+        }
+
+        private static void AddRectangleCandidate(List<Rectangle[]> candidates, Rectangle[] value)
+        {
+            if (value == null || value.Length != 8) return;
+            foreach (Rectangle[] existing in candidates)
+            {
+                bool same = true;
+                for (int index = 0; index < value.Length; index++)
+                {
+                    if (Math.Abs(existing[index].X - value[index].X) > 1
+                        || Math.Abs(existing[index].Y - value[index].Y) > 1
+                        || Math.Abs(existing[index].Width - value[index].Width) > 1
+                        || Math.Abs(existing[index].Height - value[index].Height) > 1) { same = false; break; }
+                }
+                if (same) return;
+            }
+            candidates.Add(value);
         }
 
         public static Rectangle[] GetSlotRectangles(Bitmap screenshot)
@@ -1443,7 +1512,25 @@ namespace GtaCasinoAssistant
 
         public static int DetectCursorSlot(Bitmap screenshot)
         {
-            Rectangle[] slots = GetCursorSlotRectangles(screenshot);
+            if (screenshot == null) return 0;
+            int winner = 0;
+            double winnerStrength = 0;
+            foreach (Rectangle[] slots in GetCursorSlotRectangleCandidates(screenshot))
+            {
+                double strength;
+                int current = DetectCursorSlotInLayout(screenshot, slots, out strength);
+                if (current != 0 && strength > winnerStrength)
+                {
+                    winner = current;
+                    winnerStrength = strength;
+                }
+            }
+            return winner;
+        }
+
+        private static int DetectCursorSlotInLayout(Bitmap screenshot, Rectangle[] slots, out double strength)
+        {
+            strength = 0;
             if (slots.Length != 8) return 0;
             double best = -1, runnerUp = -1;
             int bestSlot = 0;
@@ -1493,7 +1580,27 @@ namespace GtaCasinoAssistant
             // returns 0 and therefore never overrides the last stable cursor.
             double minimumScore = screenshot.Width < 1600 ? 0.012 : 0.020;
             double minimumLead = screenshot.Width < 1600 ? 0.003 : 0.004;
-            return best >= minimumScore && best - runnerUp >= minimumLead ? bestSlot : 0;
+            double lead = best - runnerUp;
+            if (best < minimumScore || lead < minimumLead) return 0;
+            strength = best + lead;
+            return bestSlot;
+        }
+
+        private static List<Rectangle[]> GetCursorSlotRectangleCandidates(Bitmap screenshot)
+        {
+            List<Rectangle[]> result = new List<Rectangle[]>();
+            AddRectangleCandidate(result, GetCursorSlotRectangles(screenshot));
+            foreach (CanonicalScreenTransform transform in CanonicalScreenLayouts.Create(screenshot))
+            {
+                Rectangle[] rectangles = new Rectangle[8];
+                int index = 0;
+                for (int row = 0; row < 4; row++)
+                    for (int col = 0; col < 2; col++)
+                        rectangles[index++] = transform.Map(new Rectangle(
+                            474 + col * 145, 270 + row * 145, 120, 121));
+                AddRectangleCandidate(result, rectangles);
+            }
+            return result;
         }
 
         private static Rectangle[] GetCursorSlotRectangles(Bitmap screenshot)
@@ -1559,11 +1666,10 @@ namespace GtaCasinoAssistant
             return sampled > 0 && red / (double)sampled >= 0.055;
         }
 
-        private static List<byte[,]> ExtractSlots(Bitmap screenshot)
+        private static List<byte[,]> ExtractSlots(Bitmap screenshot, Rectangle[] rectangles)
         {
             List<byte[,]> result = new List<byte[,]>();
-            Rectangle[] rectangles = GetSlotRectangles(screenshot);
-            if (rectangles.Length != 8) return result;
+            if (rectangles == null || rectangles.Length != 8) return result;
             foreach (Rectangle rectangle in rectangles)
             {
                 using (Bitmap crop = Crop(screenshot, rectangle.X, rectangle.Y, rectangle.Width, rectangle.Height))
@@ -1706,6 +1812,87 @@ namespace GtaCasinoAssistant
         }
     }
 
+    internal sealed class CanonicalScreenTransform
+    {
+        public string Name;
+        public double ScaleX;
+        public double ScaleY;
+        public double OffsetX;
+        public double OffsetY;
+
+        public double RadiusScale { get { return Math.Min(Math.Abs(ScaleX), Math.Abs(ScaleY)); } }
+        public int X(double canonicalX) { return (int)Math.Round(OffsetX + canonicalX * ScaleX); }
+        public int Y(double canonicalY) { return (int)Math.Round(OffsetY + canonicalY * ScaleY); }
+
+        public Rectangle Map(Rectangle canonical)
+        {
+            return new Rectangle(
+                X(canonical.X), Y(canonical.Y),
+                Math.Max(1, (int)Math.Round(canonical.Width * ScaleX)),
+                Math.Max(1, (int)Math.Round(canonical.Height * ScaleY)));
+        }
+    }
+
+    internal static class CanonicalScreenLayouts
+    {
+        private const double ReferenceWidth = 1920.0;
+        private const double ReferenceHeight = 1080.0;
+
+        public static List<CanonicalScreenTransform> Create(Bitmap image)
+        {
+            List<CanonicalScreenTransform> result = new List<CanonicalScreenTransform>();
+            if (image == null || image.Width <= 0 || image.Height <= 0) return result;
+
+            double sx = image.Width / ReferenceWidth;
+            double sy = image.Height / ReferenceHeight;
+            Add(result, "stretch", sx, sy, 0, 0);
+
+            double fit = Math.Min(sx, sy);
+            double fitX = (image.Width - ReferenceWidth * fit) / 2.0;
+            double fitY = (image.Height - ReferenceHeight * fit) / 2.0;
+            Add(result, "fit-center", fit, fit, fitX, fitY);
+            Add(result, "fit-top", fit, fit, fitX, 0);
+
+            // GTA's 16:10 HUD commonly keeps the 16:9 reference width and
+            // anchors it near the top instead of stretching it vertically.
+            Add(result, "width-top", sx, sx, 0, 0);
+            Add(result, "width-center", sx, sx, 0, (image.Height - ReferenceHeight * sx) / 2.0);
+
+            // Safe-zone settings can move the whole hacking panel slightly
+            // toward or away from the centre. Try a small bounded family and
+            // require the scanner's structural checks to accept the result.
+            foreach (double factor in new double[] { 0.96, 1.04 })
+            {
+                double scale = fit * factor;
+                Add(result, "safe-" + factor.ToString("F2"), scale, scale,
+                    (image.Width - ReferenceWidth * scale) / 2.0,
+                    (image.Height - ReferenceHeight * scale) / 2.0);
+            }
+            return result;
+        }
+
+        private static void Add(List<CanonicalScreenTransform> result, string name,
+            double scaleX, double scaleY, double offsetX, double offsetY)
+        {
+            if (scaleX <= 0 || scaleY <= 0) return;
+            foreach (CanonicalScreenTransform existing in result)
+            {
+                if (Math.Abs(existing.ScaleX - scaleX) < 0.0001
+                    && Math.Abs(existing.ScaleY - scaleY) < 0.0001
+                    && Math.Abs(existing.OffsetX - offsetX) < 0.5
+                    && Math.Abs(existing.OffsetY - offsetY) < 0.5) return;
+            }
+            result.Add(new CanonicalScreenTransform
+            {
+                Name = name,
+                ScaleX = scaleX,
+                ScaleY = scaleY,
+                OffsetX = offsetX,
+                OffsetY = offsetY
+            });
+        }
+    }
+
     public sealed class CayoVoltageResult
     {
         public int Target;
@@ -1726,6 +1913,11 @@ namespace GtaCasinoAssistant
     // and the target has at least one mathematically valid wiring permutation.
     public static class CayoVoltageScanner
     {
+        public static string LastDiagnostic { get; private set; }
+        private static int _preferredTransform = -1;
+        private static int _preferredWidth;
+        private static int _preferredHeight;
+        private static int _lastThreshold = 100;
         private static readonly int[][] DigitPatterns = new int[][]
         {
             new int[] { 1, 1, 1, 0, 1, 1, 1 },
@@ -1759,14 +1951,60 @@ namespace GtaCasinoAssistant
         {
             result = null;
             if (screenshot == null || screenshot.Width < 960 || screenshot.Height < 540) return false;
+            List<CanonicalScreenTransform> transforms = CanonicalScreenLayouts.Create(screenshot);
+            if (_preferredWidth == screenshot.Width && _preferredHeight == screenshot.Height
+                && _preferredTransform >= 0 && _preferredTransform < transforms.Count)
+            {
+                CayoVoltageResult preferred;
+                if (TryScanTransform(screenshot, transforms[_preferredTransform], out preferred))
+                {
+                    result = preferred;
+                    LastDiagnostic = "ok " + transforms[_preferredTransform].Name + " threshold=" + _lastThreshold + " cached";
+                    return true;
+                }
+            }
+
+            for (int index = 0; index < transforms.Count; index++)
+            {
+                CayoVoltageResult current;
+                if (!TryScanTransform(screenshot, transforms[index], out current)) continue;
+                result = current;
+                _preferredTransform = index;
+                _preferredWidth = screenshot.Width;
+                _preferredHeight = screenshot.Height;
+                LastDiagnostic = "ok " + transforms[index].Name + " threshold=" + _lastThreshold;
+                return true;
+            }
+            LastDiagnostic = "no valid layout " + screenshot.Width + "x" + screenshot.Height;
+            return false;
+        }
+
+        private static bool TryScanTransform(Bitmap screenshot, CanonicalScreenTransform transform, out CayoVoltageResult result)
+        {
+            result = null;
+            foreach (int threshold in new int[] { 100, 70, 130, 160 })
+            {
+                CayoVoltageResult current;
+                if (!TryScanTransformAtThreshold(screenshot, transform, threshold, out current)) continue;
+                _lastThreshold = threshold;
+                result = current;
+                return true;
+            }
+            return false;
+        }
+
+        private static bool TryScanTransformAtThreshold(Bitmap screenshot, CanonicalScreenTransform transform,
+            int threshold, out CayoVoltageResult result)
+        {
+            result = null;
             int[] targetDigits = new int[3];
             int[] left = new int[3];
             int[] right = new int[3];
             for (int index = 0; index < 3; index++)
             {
-                targetDigits[index] = ReadDigit(screenshot, TargetX[index], TargetY);
-                left[index] = ReadDigit(screenshot, LeftX, LeftY[index]);
-                right[index] = ReadMultiplier(screenshot, index);
+                targetDigits[index] = ReadDigit(screenshot, TargetX[index], TargetY, transform, threshold);
+                left[index] = ReadDigit(screenshot, LeftX, LeftY[index], transform, threshold);
+                right[index] = ReadMultiplier(screenshot, index, transform, threshold);
                 if (targetDigits[index] < 0 || left[index] < 0 || right[index] < 0) return false;
             }
             int[] sortedRight = (int[])right.Clone();
@@ -1802,10 +2040,10 @@ namespace GtaCasinoAssistant
             return matches;
         }
 
-        private static int ReadDigit(Bitmap image, int[] xs, int[] ys)
+        private static int ReadDigit(Bitmap image, int[] xs, int[] ys, CanonicalScreenTransform transform, int threshold)
         {
             int[] observed = new int[7];
-            for (int i = 0; i < 7; i++) observed[i] = IsBright(image, xs[i], ys[i], 100) ? 1 : 0;
+            for (int i = 0; i < 7; i++) observed[i] = IsBright(image, xs[i], ys[i], threshold, transform) ? 1 : 0;
             for (int digit = 0; digit < DigitPatterns.Length; digit++)
             {
                 bool same = true;
@@ -1815,22 +2053,23 @@ namespace GtaCasinoAssistant
             return -1;
         }
 
-        private static int ReadMultiplier(Bitmap image, int row)
+        private static int ReadMultiplier(Bitmap image, int row, CanonicalScreenTransform transform, int threshold)
         {
             int baseY = row == 0 ? 0 : row == 1 ? 236 : 470;
-            bool lower = IsBright(image, 1351, 305 + baseY, 100);
-            bool upper = IsBright(image, 1349, 277 + baseY, 100);
+            bool lower = IsBright(image, 1351, 305 + baseY, threshold, transform);
+            bool upper = IsBright(image, 1349, 277 + baseY, threshold, transform);
             if (!lower && upper) return 10;
             if (lower && !upper) return 2;
             if (!lower && !upper) return 1;
             return -1;
         }
 
-        private static bool IsBright(Bitmap image, int referenceX, int referenceY, int threshold)
+        private static bool IsBright(Bitmap image, int referenceX, int referenceY, int threshold,
+            CanonicalScreenTransform transform)
         {
-            int x = Math.Max(0, Math.Min(image.Width - 1, (int)Math.Round(referenceX * image.Width / 1920.0)));
-            int y = Math.Max(0, Math.Min(image.Height - 1, (int)Math.Round(referenceY * image.Height / 1080.0)));
-            int radius = Math.Max(1, (int)Math.Round(Math.Min(image.Width / 1920.0, image.Height / 1080.0)));
+            int x = Math.Max(0, Math.Min(image.Width - 1, transform.X(referenceX)));
+            int y = Math.Max(0, Math.Min(image.Height - 1, transform.Y(referenceY)));
+            int radius = Math.Max(1, (int)Math.Round(transform.RadiusScale * 1.5));
             int maximum = 0;
             for (int yy = Math.Max(0, y - radius); yy <= Math.Min(image.Height - 1, y + radius); yy++)
                 for (int xx = Math.Max(0, x - radius); xx <= Math.Min(image.Width - 1, x + radius); xx++)
@@ -1854,26 +2093,76 @@ namespace GtaCasinoAssistant
     public static class CasinoKeypadScanner
     {
         public static string LastRingDiagnostic { get; private set; }
+        public static string LastPatternDiagnostic { get; private set; }
+        private static int _preferredTransform = -1;
+        private static int _preferredWidth;
+        private static int _preferredHeight;
 
         public static bool ScanPattern(Bitmap screenshot, out CasinoKeypadResult result)
         {
             result = null;
             if (screenshot == null || screenshot.Width < 960 || screenshot.Height < 540) return false;
+            List<CanonicalScreenTransform> transforms = CanonicalScreenLayouts.Create(screenshot);
+            if (_preferredWidth == screenshot.Width && _preferredHeight == screenshot.Height
+                && _preferredTransform >= 0 && _preferredTransform < transforms.Count)
+            {
+                CasinoKeypadResult preferred;
+                if (TryScanPatternTransform(screenshot, transforms[_preferredTransform], out preferred))
+                {
+                    result = preferred;
+                    LastPatternDiagnostic = "ok " + transforms[_preferredTransform].Name + " cached";
+                    return true;
+                }
+            }
+
+            CasinoKeypadResult winner = null;
+            int winnerIndex = -1;
+            for (int index = 0; index < transforms.Count; index++)
+            {
+                CasinoKeypadResult current;
+                if (!TryScanPatternTransform(screenshot, transforms[index], out current)) continue;
+                if (winner == null || current.Confidence > winner.Confidence)
+                {
+                    winner = current;
+                    winnerIndex = index;
+                }
+            }
+            if (winner == null)
+            {
+                LastPatternDiagnostic = "no valid layout " + screenshot.Width + "x" + screenshot.Height;
+                return false;
+            }
+            result = winner;
+            _preferredTransform = winnerIndex;
+            _preferredWidth = screenshot.Width;
+            _preferredHeight = screenshot.Height;
+            LastPatternDiagnostic = "ok " + transforms[winnerIndex].Name;
+            return true;
+        }
+
+        private static bool TryScanPatternTransform(Bitmap screenshot, CanonicalScreenTransform transform,
+            out CasinoKeypadResult result)
+        {
+            result = null;
             int[] rows = new int[6];
+            double confidenceTotal = 0;
             for (int column = 0; column < rows.Length; column++)
             {
                 int bestRow = -1, bestCount = 0, secondCount = 0;
                 for (int row = 0; row < 5; row++)
                 {
-                    int count = CountCyan(screenshot, column, row);
+                    int count = CountCyan(screenshot, column, row, transform);
                     if (count > bestCount) { secondCount = bestCount; bestCount = count; bestRow = row; }
                     else if (count > secondCount) secondCount = count;
                 }
-                int minimum = Math.Max(6, (int)Math.Round(screenshot.Width / 1920.0 * screenshot.Height / 1080.0 * 18));
+                // Sampling stride scales with the layout, so the observed dot
+                // count stays roughly constant from 720p through 4K.
+                int minimum = 8;
                 if (bestRow < 0 || bestCount < minimum || bestCount < secondCount * 1.25) return false;
                 rows[column] = bestRow + 1;
+                confidenceTotal += Math.Min(1.0, (bestCount - secondCount) / (double)Math.Max(minimum, bestCount));
             }
-            result = new CasinoKeypadResult { Rows = rows, Confidence = 0.96 };
+            result = new CasinoKeypadResult { Rows = rows, Confidence = confidenceTotal / rows.Length };
             return true;
         }
 
@@ -1896,20 +2185,50 @@ namespace GtaCasinoAssistant
             if (screenshot == null || column < 1 || column > 6 || screenshot.Width < 960 || screenshot.Height < 540)
                 return false;
 
-            double scaleX = screenshot.Width / 1920.0;
-            double scaleY = screenshot.Height / 1080.0;
-            double radiusScale = Math.Min(scaleX, scaleY);
+            List<CanonicalScreenTransform> transforms = CanonicalScreenLayouts.Create(screenshot);
+            if (_preferredWidth == screenshot.Width && _preferredHeight == screenshot.Height
+                && _preferredTransform >= 0 && _preferredTransform < transforms.Count)
+            {
+                string preferredDiagnostic;
+                if (TryDetectRingRowTransform(screenshot, column, transforms[_preferredTransform], out row, out preferredDiagnostic))
+                {
+                    LastRingDiagnostic = preferredDiagnostic + " layout=" + transforms[_preferredTransform].Name;
+                    return true;
+                }
+            }
+
+            for (int index = 0; index < transforms.Count; index++)
+            {
+                string diagnostic;
+                if (!TryDetectRingRowTransform(screenshot, column, transforms[index], out row, out diagnostic)) continue;
+                _preferredTransform = index;
+                _preferredWidth = screenshot.Width;
+                _preferredHeight = screenshot.Height;
+                LastRingDiagnostic = diagnostic + " layout=" + transforms[index].Name;
+                return true;
+            }
+            LastRingDiagnostic = "miss col=" + column + " layouts=" + transforms.Count;
+            return false;
+        }
+
+        private static bool TryDetectRingRowTransform(Bitmap screenshot, int column,
+            CanonicalScreenTransform transform, out int row, out string diagnostic)
+        {
+            row = 0;
+            diagnostic = "";
+
+            double radiusScale = transform.RadiusScale;
             double innerRadius = Math.Max(18.0, 43.0 * radiusScale);
             double outerRadius = Math.Max(innerRadius + 5.0, 56.0 * radiusScale);
             double innerSquared = innerRadius * innerRadius;
             double outerSquared = outerRadius * outerRadius;
-            int centerX = (int)Math.Round((499 + (column - 1) * 108) * scaleX);
+            int centerX = transform.X(499 + (column - 1) * 108);
             int bestRow = 0;
             double bestRatio = 0, secondRatio = 0;
 
             for (int candidate = 1; candidate <= 5; candidate++)
             {
-                int centerY = (int)Math.Round((343 + (candidate - 1) * 107) * scaleY);
+                int centerY = transform.Y(343 + (candidate - 1) * 107);
                 int radius = (int)Math.Ceiling(outerRadius);
                 int bright = 0, samples = 0;
                 int step = Math.Max(1, (int)Math.Floor(radiusScale));
@@ -1941,7 +2260,7 @@ namespace GtaCasinoAssistant
             if (bestRow != 0 && bestRatio >= 0.10 && bestRatio >= secondRatio * 1.55)
             {
                 row = bestRow;
-                LastRingDiagnostic = "annulus col=" + column + " row=" + row + " score=" + bestRatio.ToString("F3");
+                diagnostic = "annulus col=" + column + " row=" + row + " score=" + bestRatio.ToString("F3");
                 return true;
             }
 
@@ -1951,32 +2270,31 @@ namespace GtaCasinoAssistant
             // far more bright pixels than the five inactive outlines.
             int fallbackRow;
             double fallbackBest, fallbackSecond;
-            if (TryDetectRingByCellBrightness(screenshot, column, out fallbackRow, out fallbackBest, out fallbackSecond))
+            if (TryDetectRingByCellBrightness(screenshot, column, transform, out fallbackRow, out fallbackBest, out fallbackSecond))
             {
                 row = fallbackRow;
-                LastRingDiagnostic = "cell col=" + column + " row=" + row + " score=" + fallbackBest.ToString("F3");
+                diagnostic = "cell col=" + column + " row=" + row + " score=" + fallbackBest.ToString("F3");
                 return true;
             }
-            LastRingDiagnostic = "miss col=" + column + " annulus=" + bestRatio.ToString("F3")
+            diagnostic = "miss col=" + column + " annulus=" + bestRatio.ToString("F3")
                 + "/" + secondRatio.ToString("F3") + " cell=" + fallbackBest.ToString("F3")
                 + "/" + fallbackSecond.ToString("F3");
             return false;
         }
 
-        private static bool TryDetectRingByCellBrightness(Bitmap image, int column, out int row, out double best, out double second)
+        private static bool TryDetectRingByCellBrightness(Bitmap image, int column,
+            CanonicalScreenTransform transform, out int row, out double best, out double second)
         {
             row = 0; best = 0; second = 0;
-            double scaleX = image.Width / 1920.0;
-            double scaleY = image.Height / 1080.0;
-            int x1 = (int)Math.Round((440 + (column - 1) * 108) * scaleX);
-            int x2 = (int)Math.Round((558 + (column - 1) * 108) * scaleX);
-            int step = Math.Max(1, (int)Math.Floor(Math.Min(scaleX, scaleY) * 2));
+            int x1 = transform.X(440 + (column - 1) * 108);
+            int x2 = transform.X(558 + (column - 1) * 108);
+            int step = Math.Max(1, (int)Math.Floor(transform.RadiusScale * 2));
             x1 = Math.Max(0, Math.Min(image.Width - 1, x1));
             x2 = Math.Max(x1 + 1, Math.Min(image.Width, x2));
             for (int candidate = 1; candidate <= 5; candidate++)
             {
-                int y1 = (int)Math.Round((289 + (candidate - 1) * 107) * scaleY);
-                int y2 = (int)Math.Round((396 + (candidate - 1) * 107) * scaleY);
+                int y1 = transform.Y(289 + (candidate - 1) * 107);
+                int y2 = transform.Y(396 + (candidate - 1) * 107);
                 y1 = Math.Max(0, Math.Min(image.Height - 1, y1));
                 y2 = Math.Max(y1 + 1, Math.Min(image.Height, y2));
                 int bright = 0, samples = 0;
@@ -2009,18 +2327,16 @@ namespace GtaCasinoAssistant
             return count == 0 ? Color.Black : Color.FromArgb(r / count, g / count, b / count);
         }
 
-        private static int CountCyan(Bitmap image, int column, int row)
+        private static int CountCyan(Bitmap image, int column, int row, CanonicalScreenTransform transform)
         {
-            double scaleX = image.Width / 1920.0;
-            double scaleY = image.Height / 1080.0;
-            int x1 = (int)Math.Round((456 + column * 108) * scaleX);
-            int x2 = (int)Math.Round((557 + column * 108) * scaleX);
+            int x1 = transform.X(456 + column * 108);
+            int x2 = transform.X(557 + column * 108);
             double rowHeight = (831 - 297) / 5.0;
-            int y1 = (int)Math.Round((297 + row * rowHeight) * scaleY);
-            int y2 = (int)Math.Round((297 + (row + 1) * rowHeight) * scaleY);
+            int y1 = transform.Y(297 + row * rowHeight);
+            int y2 = transform.Y(297 + (row + 1) * rowHeight);
             x1 = Math.Max(0, Math.Min(image.Width - 1, x1)); x2 = Math.Max(x1 + 1, Math.Min(image.Width, x2));
             y1 = Math.Max(0, Math.Min(image.Height - 1, y1)); y2 = Math.Max(y1 + 1, Math.Min(image.Height, y2));
-            int step = Math.Max(1, (int)Math.Round(Math.Min(scaleX, scaleY) * 2));
+            int step = Math.Max(1, (int)Math.Round(transform.RadiusScale * 2));
             int count = 0;
             for (int y = y1; y < y2; y += step)
                 for (int x = x1; x < x2; x += step)
@@ -2032,7 +2348,7 @@ namespace GtaCasinoAssistant
         {
             int max = Math.Max(color.R, Math.Max(color.G, color.B));
             int min = Math.Min(color.R, Math.Min(color.G, color.B));
-            return max >= 135 && max - min >= 35 && color.G > color.R + 20 && color.B > color.R + 10;
+            return max >= 85 && max - min >= 24 && color.G > color.R + 12 && color.B > color.R + 8;
         }
     }
 
@@ -2058,8 +2374,11 @@ namespace GtaCasinoAssistant
     {
         public static string LastDiagnostic { get; private set; }
         private static int _preferredTransform = -1;
-        private const double MinimumRowScore = 0.30;
-        private const double MinimumRowMargin = 0.012;
+        private static int _preferredWidth;
+        private static int _preferredHeight;
+        private const double MinimumAssignmentAverage = 0.34;
+        private const double MinimumAssignedRowScore = 0.24;
+        private const double MinimumAssignmentMargin = 0.002;
         private static readonly Rectangle[] TargetRects = new Rectangle[]
         {
             new Rectangle(907, 331, 655, 100), new Rectangle(907, 404, 655, 100),
@@ -2104,7 +2423,8 @@ namespace GtaCasinoAssistant
                 new ScreenTransform { Scale = baseScale, OffsetX = centerX, OffsetY = centerY + 40 * baseScale }
             };
 
-            if (_preferredTransform >= 0 && _preferredTransform < candidates.Length)
+            if (_preferredWidth == screenshot.Width && _preferredHeight == screenshot.Height
+                && _preferredTransform >= 0 && _preferredTransform < candidates.Length)
             {
                 ScreenTransform preferred = candidates[_preferredTransform];
                 CayoFingerprintResult preferredResult;
@@ -2126,13 +2446,22 @@ namespace GtaCasinoAssistant
                 candidateIndex++;
                 CayoFingerprintResult current;
                 string diagnostic;
-                if (TryScanTransform(screenshot, candidate.Scale, candidate.OffsetX, candidate.OffsetY, out current, out diagnostic)
-                    && (winner == null || current.Confidence > winner.Confidence)) { winner = current; winnerIndex = candidateIndex - 1; }
+                if (TryScanTransform(screenshot, candidate.Scale, candidate.OffsetX, candidate.OffsetY, out current, out diagnostic))
+                {
+                    if (winner == null || current.Confidence > winner.Confidence) { winner = current; winnerIndex = candidateIndex - 1; }
+                }
                 if (!String.IsNullOrEmpty(diagnostic)) diagnostics.Add(candidateIndex + ":" + diagnostic);
             }
             result = winner;
-            if (winnerIndex >= 0) _preferredTransform = winnerIndex;
-            LastDiagnostic = result != null ? "ok " + result.Confidence.ToString("F3") : String.Join("; ", diagnostics.ToArray());
+            if (winnerIndex >= 0)
+            {
+                _preferredTransform = winnerIndex;
+                _preferredWidth = screenshot.Width;
+                _preferredHeight = screenshot.Height;
+            }
+            LastDiagnostic = result != null
+                ? "ok " + result.Confidence.ToString("F3") + " layout=" + (winnerIndex + 1)
+                : String.Join("; ", diagnostics.ToArray());
             return result != null;
         }
 
@@ -2152,7 +2481,8 @@ namespace GtaCasinoAssistant
                 new ScreenTransform { Scale = baseScale * 0.98, OffsetX = centerX + 45 * baseScale, OffsetY = centerY - 60 * baseScale },
                 new ScreenTransform { Scale = baseScale, OffsetX = centerX, OffsetY = centerY + 40 * baseScale }
             };
-            int tIndex = _preferredTransform >= 0 && _preferredTransform < candidates.Length ? _preferredTransform : 1;
+            int tIndex = _preferredWidth == screenshot.Width && _preferredHeight == screenshot.Height
+                && _preferredTransform >= 0 && _preferredTransform < candidates.Length ? _preferredTransform : 1;
             ScreenTransform transform = candidates[tIndex];
 
             int bestRow = -1;
@@ -2212,8 +2542,7 @@ namespace GtaCasinoAssistant
                     scans.Add(scan);
                 }
 
-                int[] clicks = new int[8];
-                double scoreSum = 0;
+                double[,] scores = new double[8, 8];
                 int cursorRow = -1;
                 double cursorScore = 0;
                 for (int row = 0; row < 8; row++)
@@ -2221,22 +2550,8 @@ namespace GtaCasinoAssistant
                     byte[,] scanGray = ToGray(scans[row], 96, 14);
                     TemplateData scanTemplate = Prepare(scanGray);
                     if (scanTemplate == null) { diagnostic = "row " + (row + 1) + " blank"; return false; }
-                    double best = -1, second = -1;
-                    int match = -1;
                     for (int part = 0; part < 8; part++)
-                    {
-                        double score = Correlate(targets[part], scanTemplate);
-                        if (score > best) { second = best; best = score; match = part; }
-                        else if (score > second) second = score;
-                    }
-                    if (match < 0 || best < MinimumRowScore || best - second < MinimumRowMargin)
-                    {
-                        diagnostic = "row " + (row + 1) + " score " + best.ToString("F3") + "/" + (best - second).ToString("F3");
-                        return false;
-                    }
-                    int offset = (row - match + 8) % 8;
-                    clicks[row] = offset == 0 ? 0 : offset <= 4 ? offset : -(8 - offset);
-                    scoreSum += best;
+                        scores[row, part] = Correlate(targets[part], scanTemplate);
 
                     Rectangle scan = ScanRects[row];
                     using (Bitmap leftInd = CropScaled(screenshot, new Rectangle(scan.X - 55, scan.Y, 45, scan.Height), scale, offsetX, offsetY))
@@ -2250,12 +2565,35 @@ namespace GtaCasinoAssistant
                         }
                     }
                 }
+
+                int[] assignment;
+                double assignmentScore, runnerScore;
+                FindBestCayoAssignment(scores, out assignment, out assignmentScore, out runnerScore);
+                if (assignment == null) { diagnostic = "assignment missing"; return false; }
+                double average = assignmentScore / 8.0;
+                double margin = (assignmentScore - runnerScore) / 8.0;
+                double minimumAssigned = Double.MaxValue;
+                for (int row = 0; row < 8; row++) minimumAssigned = Math.Min(minimumAssigned, scores[row, assignment[row]]);
+                if (average < MinimumAssignmentAverage || minimumAssigned < MinimumAssignedRowScore
+                    || margin < MinimumAssignmentMargin)
+                {
+                    diagnostic = "assignment avg=" + average.ToString("F3") + " min=" + minimumAssigned.ToString("F3")
+                        + " margin=" + margin.ToString("F3");
+                    return false;
+                }
+
+                int[] clicks = new int[8];
+                for (int row = 0; row < 8; row++)
+                {
+                    int offset = (row - assignment[row] + 8) % 8;
+                    clicks[row] = offset == 0 ? 0 : offset <= 4 ? offset : -(8 - offset);
+                }
                 if (cursorScore < 0.04) { diagnostic = "cursor " + cursorScore.ToString("F3"); return false; }
                 result = new CayoFingerprintResult
                 {
                     Clicks = clicks,
                     CursorRow = cursorRow,
-                    Confidence = scoreSum / 8.0,
+                    Confidence = average,
                     TargetSignature = MakeSignature(targets)
                 };
                 return true;
@@ -2264,6 +2602,62 @@ namespace GtaCasinoAssistant
             {
                 foreach (Bitmap scan in scans) scan.Dispose();
             }
+        }
+
+        private static void FindBestCayoAssignment(double[,] scores, out int[] assignment,
+            out double bestScore, out double runnerScore)
+        {
+            bestScore = SolveCayoAssignment(scores, -1, -1, out assignment);
+            runnerScore = Double.NegativeInfinity;
+            if (assignment == null) return;
+            for (int row = 0; row < 8; row++)
+            {
+                int[] ignored;
+                double alternative = SolveCayoAssignment(scores, row, assignment[row], out ignored);
+                if (alternative > runnerScore) runnerScore = alternative;
+            }
+        }
+
+        private static double SolveCayoAssignment(double[,] scores, int forbiddenRow,
+            int forbiddenPart, out int[] assignment)
+        {
+            assignment = null;
+            double[] current = new double[256];
+            for (int mask = 0; mask < current.Length; mask++) current[mask] = Double.NegativeInfinity;
+            current[0] = 0;
+            int[,] parentMask = new int[9, 256];
+            int[,] parentPart = new int[9, 256];
+            for (int row = 0; row < 8; row++)
+            {
+                double[] next = new double[256];
+                for (int mask = 0; mask < next.Length; mask++) next[mask] = Double.NegativeInfinity;
+                for (int mask = 0; mask < 256; mask++)
+                {
+                    if (Double.IsNegativeInfinity(current[mask])) continue;
+                    for (int part = 0; part < 8; part++)
+                    {
+                        int bit = 1 << part;
+                        if ((mask & bit) != 0 || (row == forbiddenRow && part == forbiddenPart)) continue;
+                        int nextMask = mask | bit;
+                        double value = current[mask] + scores[row, part];
+                        if (value <= next[nextMask]) continue;
+                        next[nextMask] = value;
+                        parentMask[row + 1, nextMask] = mask;
+                        parentPart[row + 1, nextMask] = part;
+                    }
+                }
+                current = next;
+            }
+
+            if (Double.IsNegativeInfinity(current[255])) return current[255];
+            assignment = new int[8];
+            int cursor = 255;
+            for (int row = 8; row >= 1; row--)
+            {
+                assignment[row - 1] = parentPart[row, cursor];
+                cursor = parentMask[row, cursor];
+            }
+            return current[255];
         }
 
         public static bool SameTargetSignature(string left, string right)

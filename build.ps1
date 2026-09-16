@@ -26,4 +26,10 @@ if ($LASTEXITCODE -ne 0) {
     throw "Compilation failed with exit code $LASTEXITCODE."
 }
 
+$templateOutput = Join-Path $outputDir "templates"
+New-Item -ItemType Directory -Force -Path $templateOutput | Out-Null
+Copy-Item -LiteralPath (Get-ChildItem (Join-Path $projectRoot "templates") -File |
+    Where-Object { $_.Name -match '^target_[1-4]_(master|slice_[1-4])\.png$' } |
+    Select-Object -ExpandProperty FullName) -Destination $templateOutput -Force
+
 Write-Host "Built $Configuration output in $outputDir" -ForegroundColor Green

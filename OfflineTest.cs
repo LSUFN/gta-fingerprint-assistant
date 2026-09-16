@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.IO;
 
 namespace GtaCasinoAssistant
@@ -40,6 +42,11 @@ namespace GtaCasinoAssistant
             if (args.Length >= 2 && args[0] == "--cayo")
             {
                 RunCayo(args, 1);
+                return;
+            }
+            if (args.Length == 2 && args[0] == "--cayo-multires")
+            {
+                RunCayoMultiResolution(args[1]);
                 return;
             }
             if (args.Length == 2 && args[0] == "--voltage")
@@ -163,6 +170,46 @@ namespace GtaCasinoAssistant
             Environment.ExitCode = allRead ? 0 : 1;
         }
 
+        private static void RunCayoMultiResolution(string imagePath)
+        {
+            bool allPassed = true;
+            using (Bitmap source = new Bitmap(imagePath))
+            {
+                CayoFingerprintResult expected;
+                if (!CayoFingerprintScanner.ScanBitmap(source, out expected))
+                {
+                    Console.WriteLine("source: FAIL " + CayoFingerprintScanner.LastDiagnostic);
+                    Environment.ExitCode = 1;
+                    return;
+                }
+                string[,] cases = MultiResolutionCases();
+                for (int index = 0; index < cases.GetLength(0); index++)
+                {
+                    int width = Int32.Parse(cases[index, 0]);
+                    int height = Int32.Parse(cases[index, 1]);
+                    string layout = cases[index, 2];
+                    using (Bitmap frame = RenderLayout(source, width, height, layout))
+                    {
+                        CayoFingerprintResult actual;
+                        bool passed = CayoFingerprintScanner.ScanBitmap(frame, out actual)
+                            && actual.CursorRow == expected.CursorRow
+                            && SameArray(actual.Clicks, expected.Clicks);
+                        allPassed &= passed;
+                        Console.WriteLine("cayo {0}x{1} {2}: {3} {4}", width, height, layout,
+                            passed ? "PASS" : "FAIL", CayoFingerprintScanner.LastDiagnostic);
+                        if (!passed)
+                        {
+                            Console.WriteLine("  expected cursor={0} clicks=[{1}]", expected.CursorRow, string.Join(",", expected.Clicks));
+                            Console.WriteLine("  actual cursor={0} clicks=[{1}]",
+                                actual == null ? -1 : actual.CursorRow,
+                                actual == null ? "" : string.Join(",", actual.Clicks));
+                        }
+                    }
+                }
+            }
+            Environment.ExitCode = allPassed ? 0 : 1;
+        }
+
         private static void RunProbe(string imagePath)
         {
             FingerprintDatabase database = new FingerprintDatabase();
@@ -208,41 +255,247 @@ namespace GtaCasinoAssistant
 
         private static void RunNewHackTests()
         {
-            bool voltagePassed;
-            using (Bitmap voltage = new Bitmap(1920, 1080))
+            int[] keypadExpected = new int[] { 1, 3, 5, 2, 4, 1 };
+            bool allPassed = true;
+            using (Bitmap voltage = BuildVoltageFixture())
+            using (Bitmap keypad = BuildKeypadFixture(keypadExpected, 3, 4))
             {
-                using (Graphics graphics = Graphics.FromImage(voltage)) graphics.Clear(Color.Black);
-                DrawVoltageDigit(voltage, 1, new int[] { 865, 849, 881, 865, 849, 881, 865 }, new int[] { 123, 137, 137, 154, 173, 173, 195 });
-                DrawVoltageDigit(voltage, 0, new int[] { 955, 939, 971, 955, 939, 971, 955 }, new int[] { 123, 137, 137, 154, 173, 173, 195 });
-                DrawVoltageDigit(voltage, 0, new int[] { 1043, 1029, 1061, 1043, 1029, 1061, 1043 }, new int[] { 123, 137, 137, 154, 173, 173, 195 });
-                int[] leftX = new int[] { 509, 495, 527, 509, 495, 527, 509 };
-                DrawVoltageDigit(voltage, 8, leftX, new int[] { 271, 287, 287, 303, 323, 323, 343 });
-                DrawVoltageDigit(voltage, 7, leftX, new int[] { 507, 522, 522, 540, 557, 557, 579 });
-                DrawVoltageDigit(voltage, 6, leftX, new int[] { 741, 755, 755, 773, 791, 791, 813 });
-                DrawPoint(voltage, 1349, 277, Color.White); // x10
-                DrawPoint(voltage, 1351, 541, Color.White); // x2
-                CayoVoltageResult result;
-                voltagePassed = CayoVoltageScanner.ScanBitmap(voltage, out result)
-                    && result.Target == 100 && SameArray(result.LeftNumbers, new int[] { 8, 7, 6 })
-                    && SameArray(result.RightMultipliers, new int[] { 10, 2, 1 })
-                    && SameArray(result.Assignment, new int[] { 0, 1, 2 });
-            }
+                string[,] cases = MultiResolutionCases();
+                for (int index = 0; index < cases.GetLength(0); index++)
+                {
+                    int width = Int32.Parse(cases[index, 0]);
+                    int height = Int32.Parse(cases[index, 1]);
+                    string layout = cases[index, 2];
+                    using (Bitmap voltageFrame = RenderLayout(voltage, width, height, layout))
+                    using (Bitmap keypadFrame = RenderLayout(keypad, width, height, layout))
+                    {
+                        CayoVoltageResult voltageResult;
+                        bool voltagePassed = CayoVoltageScanner.ScanBitmap(voltageFrame, out voltageResult)
+                            && voltageResult.Target == 100
+                            && SameArray(voltageResult.LeftNumbers, new int[] { 8, 7, 6 })
+                            && SameArray(voltageResult.RightMultipliers, new int[] { 10, 2, 1 })
+                            && SameArray(voltageResult.Assignment, new int[] { 0, 1, 2 });
 
-            bool keypadPassed;
-            using (Bitmap keypad = new Bitmap(1920, 1080))
+                        CasinoKeypadResult keypadResult;
+                        bool keypadPassed = CasinoKeypadScanner.ScanPattern(keypadFrame, out keypadResult)
+                            && SameArray(keypadResult.Rows, keypadExpected);
+                        int ringRow;
+                        bool ringPassed = CasinoKeypadScanner.TryDetectRingRow(keypadFrame, 3, out ringRow) && ringRow == 4;
+
+                        bool passed = voltagePassed && keypadPassed && ringPassed;
+                        allPassed &= passed;
+                        Console.WriteLine("{0}x{1} {2}: {3} voltage={4} keypad={5} ring={6}",
+                            width, height, layout, passed ? "PASS" : "FAIL", voltagePassed, keypadPassed, ringPassed);
+                        if (!passed)
+                        {
+                            Console.WriteLine("  voltage: " + CayoVoltageScanner.LastDiagnostic);
+                            Console.WriteLine("  keypad: " + CasinoKeypadScanner.LastPatternDiagnostic);
+                            Console.WriteLine("  ring: " + CasinoKeypadScanner.LastRingDiagnostic);
+                        }
+                    }
+                }
+
+                using (Bitmap dimVoltage = AdjustVisual(voltage, 0.32f, 0))
+                using (Bitmap dimKeypad = AdjustVisual(keypad, 0.42f, 0))
+                using (Bitmap dimVoltageFrame = RenderLayout(dimVoltage, 1600, 900, "stretch"))
+                using (Bitmap dimKeypadFrame = RenderLayout(dimKeypad, 1600, 900, "stretch"))
+                {
+                    CayoVoltageResult voltageResult;
+                    CasinoKeypadResult keypadResult;
+                    bool voltagePassed = CayoVoltageScanner.ScanBitmap(dimVoltageFrame, out voltageResult);
+                    bool keypadPassed = CasinoKeypadScanner.ScanPattern(dimKeypadFrame, out keypadResult)
+                        && SameArray(keypadResult.Rows, keypadExpected);
+                    bool passed = voltagePassed && keypadPassed;
+                    allPassed &= passed;
+                    Console.WriteLine("dim-quality 1600x900: {0} voltage={1} keypad={2}",
+                        passed ? "PASS" : "FAIL", voltagePassed, keypadPassed);
+                }
+            }
+            allPassed &= RunCasinoSyntheticMultiResolution();
+            allPassed &= RunNegativeScreenTests();
+            Environment.ExitCode = allPassed ? 0 : 1;
+        }
+
+        private static bool RunNegativeScreenTests()
+        {
+            FingerprintDatabase database = new FingerprintDatabase();
+            database.Load(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "templates"));
+            using (Bitmap blank = new Bitmap(1920, 1080))
             {
-                using (Graphics graphics = Graphics.FromImage(keypad)) graphics.Clear(Color.Black);
-                int[] xs = new int[] { 504, 612, 720, 828, 936, 1044 };
-                int[] ys = new int[] { 302, 410, 518, 626, 734 };
-                int[] expected = new int[] { 1, 3, 5, 2, 4, 1 };
-                for (int column = 0; column < xs.Length; column++) DrawPoint(keypad, xs[column], ys[expected[column] - 1], Color.Cyan);
-                CasinoKeypadResult result;
-                keypadPassed = CasinoKeypadScanner.ScanPattern(keypad, out result) && SameArray(result.Rows, expected);
+                using (Graphics graphics = Graphics.FromImage(blank)) graphics.Clear(Color.FromArgb(8, 12, 18));
+                CayoVoltageResult voltage;
+                CasinoKeypadResult keypad;
+                CayoFingerprintResult cayo;
+                FingerprintTarget target;
+                List<int> slots;
+                double confidence;
+                bool passed = !CayoVoltageScanner.ScanBitmap(blank, out voltage)
+                    && !CasinoKeypadScanner.ScanPattern(blank, out keypad)
+                    && !CayoFingerprintScanner.ScanBitmap(blank, out cayo)
+                    && !ReliableAutoScanner.ScanBitmap(database, blank, out target, out slots, out confidence);
+                Console.WriteLine("negative blank screen: " + (passed ? "PASS" : "FAIL"));
+                return passed;
             }
+        }
 
-            Console.WriteLine("voltage scanner: " + (voltagePassed ? "PASS" : "FAIL"));
-            Console.WriteLine("keypad scanner: " + (keypadPassed ? "PASS" : "FAIL"));
-            Environment.ExitCode = voltagePassed && keypadPassed ? 0 : 1;
+        private static bool RunCasinoSyntheticMultiResolution()
+        {
+            FingerprintDatabase database = new FingerprintDatabase();
+            database.Load(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "templates"));
+            int[] expectedSlots = new int[] { 1, 2, 4, 5 };
+            bool allPassed = true;
+            using (Bitmap source = BuildCasinoFixture(1, expectedSlots, 3))
+            {
+                string[,] cases = MultiResolutionCases();
+                for (int index = 0; index < cases.GetLength(0); index++)
+                {
+                    int width = Int32.Parse(cases[index, 0]);
+                    int height = Int32.Parse(cases[index, 1]);
+                    string layout = cases[index, 2];
+                    using (Bitmap frame = RenderLayout(source, width, height, layout))
+                    {
+                        FingerprintTarget target;
+                        List<int> slots;
+                        double confidence;
+                        bool detected = ReliableAutoScanner.ScanBitmap(database, frame, out target, out slots, out confidence);
+                        int cursor = ReliableAutoScanner.DetectCursorSlot(frame);
+                        bool passed = detected && target != null && target.Id == 1
+                            && Same(slots, expectedSlots) && cursor == 3;
+                        allPassed &= passed;
+                        Console.WriteLine("casino {0}x{1} {2}: {3} target={4} slots=[{5}] cursor={6} score={7:F3}",
+                            width, height, layout, passed ? "PASS" : "FAIL",
+                            target == null ? 0 : target.Id,
+                            slots == null ? "" : string.Join(",", slots.ConvertAll(value => value.ToString()).ToArray()),
+                            cursor, confidence);
+                    }
+                }
+            }
+            return allPassed;
+        }
+
+        private static string[,] MultiResolutionCases()
+        {
+            return new string[,]
+            {
+                { "1280", "720", "stretch" },
+                { "1600", "900", "stretch" },
+                { "1920", "1200", "width-top" },
+                { "2560", "1080", "fit-center" },
+                { "3440", "1440", "fit-center" },
+                { "3840", "2160", "stretch" }
+            };
+        }
+
+        private static Bitmap BuildVoltageFixture()
+        {
+            Bitmap voltage = new Bitmap(1920, 1080);
+            using (Graphics graphics = Graphics.FromImage(voltage)) graphics.Clear(Color.Black);
+            DrawVoltageDigit(voltage, 1, new int[] { 865, 849, 881, 865, 849, 881, 865 }, new int[] { 123, 137, 137, 154, 173, 173, 195 });
+            DrawVoltageDigit(voltage, 0, new int[] { 955, 939, 971, 955, 939, 971, 955 }, new int[] { 123, 137, 137, 154, 173, 173, 195 });
+            DrawVoltageDigit(voltage, 0, new int[] { 1043, 1029, 1061, 1043, 1029, 1061, 1043 }, new int[] { 123, 137, 137, 154, 173, 173, 195 });
+            int[] leftX = new int[] { 509, 495, 527, 509, 495, 527, 509 };
+            DrawVoltageDigit(voltage, 8, leftX, new int[] { 271, 287, 287, 303, 323, 323, 343 });
+            DrawVoltageDigit(voltage, 7, leftX, new int[] { 507, 522, 522, 540, 557, 557, 579 });
+            DrawVoltageDigit(voltage, 6, leftX, new int[] { 741, 755, 755, 773, 791, 791, 813 });
+            DrawPoint(voltage, 1349, 277, Color.White); // x10
+            DrawPoint(voltage, 1351, 541, Color.White); // x2
+            return voltage;
+        }
+
+        private static Bitmap BuildKeypadFixture(int[] expected, int ringColumn, int ringRow)
+        {
+            Bitmap keypad = new Bitmap(1920, 1080);
+            using (Graphics graphics = Graphics.FromImage(keypad)) graphics.Clear(Color.Black);
+            int[] xs = new int[] { 504, 612, 720, 828, 936, 1044 };
+            int[] ys = new int[] { 302, 410, 518, 626, 734 };
+            for (int column = 0; column < xs.Length; column++)
+                DrawPoint(keypad, xs[column], ys[expected[column] - 1], Color.FromArgb(20, 220, 235));
+            using (Graphics graphics = Graphics.FromImage(keypad))
+            using (Pen pen = new Pen(Color.White, 9))
+            {
+                graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                int cx = 499 + (ringColumn - 1) * 108;
+                int cy = 343 + (ringRow - 1) * 107;
+                graphics.DrawEllipse(pen, cx - 50, cy - 50, 100, 100);
+            }
+            return keypad;
+        }
+
+        private static Bitmap BuildCasinoFixture(int target, int[] slots, int cursorSlot)
+        {
+            Bitmap frame = new Bitmap(1920, 1080);
+            using (Graphics graphics = Graphics.FromImage(frame)) graphics.Clear(Color.Black);
+            Rectangle[] rectangles = ReliableAutoScanner.GetSlotRectangles(frame);
+            for (int part = 0; part < 4; part++)
+            {
+                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "templates",
+                    "target_" + target + "_slice_" + (part + 1) + ".png");
+                using (Image image = Image.FromFile(path))
+                using (Graphics graphics = Graphics.FromImage(frame))
+                {
+                    graphics.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                    Rectangle slot = rectangles[slots[part] - 1];
+                    int width = (int)Math.Round(slot.Width * 31.0 / 40.0);
+                    int height = (int)Math.Round(slot.Height * 33.0 / 39.0);
+                    Rectangle destination = new Rectangle(
+                        slot.X + (slot.Width - width) / 2,
+                        slot.Y + (slot.Height - height) / 2,
+                        width, height);
+                    graphics.DrawImage(image, destination);
+                }
+            }
+            using (Graphics graphics = Graphics.FromImage(frame))
+            using (Pen pen = new Pen(Color.White, 5))
+            {
+                Rectangle cursor = Rectangle.Inflate(rectangles[cursorSlot - 1], 11, 11);
+                graphics.DrawRectangle(pen, cursor);
+            }
+            return frame;
+        }
+
+        private static Bitmap RenderLayout(Bitmap source, int width, int height, string layout)
+        {
+            Bitmap result = new Bitmap(width, height);
+            using (Graphics graphics = Graphics.FromImage(result))
+            {
+                graphics.Clear(Color.Black);
+                graphics.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                Rectangle destination;
+                if (layout == "stretch") destination = new Rectangle(0, 0, width, height);
+                else
+                {
+                    double scale = layout == "width-top" ? width / 1920.0 : Math.Min(width / 1920.0, height / 1080.0);
+                    int w = (int)Math.Round(1920 * scale);
+                    int h = (int)Math.Round(1080 * scale);
+                    int x = (width - w) / 2;
+                    int y = layout == "width-top" ? 0 : (height - h) / 2;
+                    destination = new Rectangle(x, y, w, h);
+                }
+                graphics.DrawImage(source, destination, new Rectangle(0, 0, source.Width, source.Height), GraphicsUnit.Pixel);
+            }
+            return result;
+        }
+
+        private static Bitmap AdjustVisual(Bitmap source, float brightness, int offset)
+        {
+            Bitmap result = new Bitmap(source.Width, source.Height);
+            float shift = offset / 255.0f;
+            ColorMatrix matrix = new ColorMatrix(new float[][]
+            {
+                new float[] { brightness, 0, 0, 0, 0 },
+                new float[] { 0, brightness, 0, 0, 0 },
+                new float[] { 0, 0, brightness, 0, 0 },
+                new float[] { 0, 0, 0, 1, 0 },
+                new float[] { shift, shift, shift, 0, 1 }
+            });
+            using (ImageAttributes attributes = new ImageAttributes())
+            using (Graphics graphics = Graphics.FromImage(result))
+            {
+                attributes.SetColorMatrix(matrix);
+                graphics.DrawImage(source, new Rectangle(0, 0, result.Width, result.Height),
+                    0, 0, source.Width, source.Height, GraphicsUnit.Pixel, attributes);
+            }
+            return result;
         }
 
         private static readonly int[][] VoltageDigitPatterns = new int[][]

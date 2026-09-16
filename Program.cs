@@ -3313,7 +3313,13 @@ namespace GtaCasinoAssistant
                                     _pendingDetectionFrames = 1;
                                 }
 
-                                if (_pendingDetectionFrames >= RequiredStableFrames)
+                                // A confident first frame may enter preflight
+                                // immediately. Preflight performs an independent
+                                // second scan before any key is sent, avoiding the
+                                // old 2-frame wait + third full scan latency.
+                                int framesNeededForStableUi = conf >= FastExecutionConfidence ? 1 : RequiredStableFrames;
+                                int framesNeededForInput = conf >= FastExecutionConfidence ? 1 : RequiredGuardedFrames;
+                                if (_pendingDetectionFrames >= framesNeededForStableUi)
                                 {
                                     bool changed = !_hasStableDetection || (_current == null) || (_current.Id != matched.Id) || !ListEqual(_activeSlots, slots);
                                     _hasStableDetection = true;
@@ -3322,7 +3328,6 @@ namespace GtaCasinoAssistant
                                     if (changed) SetTarget(matched, slots, true);
                                     SetStableDetectionState(matched, slots, conf);
 
-                                    int framesNeededForInput = conf >= FastExecutionConfidence ? RequiredStableFrames : RequiredGuardedFrames;
                                     if (_autoInputEnabled && !_inputInProgress && key != _lastExecutedDetection
                                         && DateTime.UtcNow >= _casinoRetryAfterUtc
                                         && _pendingDetectionFrames >= framesNeededForInput)
